@@ -41,7 +41,6 @@ This script does the following:
 
 Requirements:
 - docker, docker compose, yq
-- the PostgreSQL container must use bind-mounts
 - a docker-compose.yml file in the current working directory
 
 ${__usage}
@@ -103,6 +102,8 @@ while [[ "$#" -gt 0 ]] ; do
     --service-name) require_arg "$@" ; ARG_SERVICE_NAME="$2"; shift ;;
     --data-dir=*) ARG_DATA_DIR="${1#*=}" ;;
     --data-dir) require_arg "$@" ; ARG_DATA_DIR="$2"; shift ;;
+    --volume=*) ARG_VOLUME="${1#*=}" ;;
+    --volume) require_arg "$@" ; ARG_VOLUME="$2"; shift ;;
     --username=*) ARG_POSTGRES_USER="${1#*=}" ;;
     --username) require_arg "$@" ; ARG_POSTGRES_USER="$2"; shift ;;
     --new-image=*) ARG_NEW_IMAGE="${1#*=}" ;;
@@ -121,7 +122,13 @@ while [[ "$#" -gt 0 ]] ; do
   shift
 done
 
-if [[ -z "${ARG_SERVICE_NAME}" || -z "${ARG_DATA_DIR}" || -z "${ARG_POSTGRES_USER}" || -z "${ARG_NEW_IMAGE}" ]] ; then
+if [[ -z "${ARG_SERVICE_NAME}" || -z "${ARG_POSTGRES_USER}" || -z "${ARG_NEW_IMAGE}" ]] ; then
+  echo "error: ${__usage}"
+  exit 1
+fi
+
+# only one of the options can be set
+if [[ -z "${ARG_DATA_DIR}" && -z "${ARG_VOLUME}" || -n "${ARG_DATA_DIR}" && -n "${ARG_VOLUME}" ]] ; then
   echo "error: ${__usage}"
   exit 1
 fi
@@ -148,14 +155,17 @@ if [[ ! -e docker-compose.yml ]] ; then
   echo "error: a docker-compose.yml file is not present in the current working directory" >&2
   exit 1
 fi
-if [[ ! -e "${ARG_DATA_DIR}" || ! -d "${ARG_DATA_DIR}" ]] ; then
-  echo "error: the given data directory does not exist or is not a directory" >&2
-  exit 1
-fi
-ARG_DATA_DIR="$(realpath -s "${ARG_DATA_DIR}")"
-if [[ -e "${ARG_DATA_DIR}-bak" ]] ; then
-  echo "error: data directory backup already exists: ${ARG_DATA_DIR}-bak" >&2
-  exit 1
+
+if [[ -n "${ARG_DATA_DIR}" ]] ; then
+  if [[ ! -e "${ARG_DATA_DIR}" || ! -d "${ARG_DATA_DIR}" ]] ; then
+    echo "error: the given data directory does not exist or is not a directory" >&2
+    exit 1
+  fi
+  ARG_DATA_DIR="$(realpath -s "${ARG_DATA_DIR}")"
+  if [[ -e "${ARG_DATA_DIR}-bak" ]] ; then
+    echo "error: data directory backup already exists: ${ARG_DATA_DIR}-bak" >&2
+    exit 1
+  fi
 fi
 
 echo "-- backup will be written to ${BACKUP_FILENAME}"
@@ -183,11 +193,25 @@ wait_for_database "${DOCKER_RUN_ID1}"
 echo "-- creating backup (this may take a while)"
 docker exec -it "${DOCKER_RUN_ID1}" pg_dumpall --username="${ARG_POSTGRES_USER}" > "${BACKUP_FILENAME}"
 
-echo "-- backup done, stopping temporary container"
-docker stop "${DOCKER_RUN_ID1}"
+if [[ -n "${ARG_VOLUME}" ]] ; then
+  echo "-- looking up docker volume path"
+  VOLUME_PATH="$(docker inspect "${DOCKER_RUN_ID1}" | jq -r '[.[0].Mounts[] | select(.Type == "volume" and (.Name | endswith("'"${ARG_VOLUME}"'")))][0].Source')"
+fi
 
-echo "-- moving the data directory"
-sudo mv "${ARG_DATA_DIR}" "${ARG_DATA_DIR}-bak"
+echo "-- backup done, stopping temporary container"
+docker stop "${DOCKER_RUN_ID1}" > /dev/null
+
+if [[ -n "${ARG_DATA_DIR}" ]] ; then
+  echo "-- moving the data directory"
+  sudo mv "${ARG_DATA_DIR}" "${ARG_DATA_DIR}-bak"
+fi
+if [[ -n "${ARG_VOLUME}" ]] ; then
+  echo "-- moving postgres data from the volume"
+  sudo mv "${VOLUME_PATH}" "${VOLUME_PATH}-bak"
+  sudo mkdir "${VOLUME_PATH}"
+  sudo chown --reference="${VOLUME_PATH}-bak" "${VOLUME_PATH}"
+  sudo chmod --reference="${VOLUME_PATH}-bak" "${VOLUME_PATH}"
+fi
 
 echo "-- replacing the referenced postgres docker image with the new image"
 yq --in-place --yaml-roundtrip '.services["'"${ARG_SERVICE_NAME}"'"].image = "'"${ARG_NEW_IMAGE}"'"' docker-compose.yml
@@ -200,4 +224,4 @@ echo "-- restoring backup (this may take a while)"
 docker exec -i "${DOCKER_RUN_ID2}" psql --username="${ARG_POSTGRES_USER}" "${ARG_POSTGRES_DB:-ARG_POSTGRES_USER}" < "${BACKUP_FILENAME}"
 
 echo "-- restore done, stopping temporary container"
-docker stop "${DOCKER_RUN_ID2}"
+docker stop "${DOCKER_RUN_ID2}" > /dev/null

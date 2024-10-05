@@ -1,0 +1,11 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      - POSTGRES_PASSWORD=tc2-pw
+      - POSTGRES_USER=tc2-user
+      - POSTGRES_DB=tc2-db
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+volumes:
+  pg-data: null
