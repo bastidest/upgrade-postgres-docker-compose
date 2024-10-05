@@ -1,0 +1,203 @@
+#!/bin/bash
+
+# MIT License
+#
+# Copyright (c) 2024 Sebastian Hiebl
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# see http://docopt.org/
+
+__name=upgrade-postgres-docker-compose
+
+__usage="Usage: ${__name} upgrade --service-name=NAME (--data-dir=DIR | --volume=VOLUME) --new-image=IMAGE --username=USER [--default-db=DB]
+       ${__name} --help"
+
+__help="${__name}
+
+Upgrades the PostgreSQL major version in a Docker Compose project.
+
+This script does the following:
+1. bring down the Docker Compose project
+2. dump the PostgreSQL container's database
+3. update the PostgreSQL image version in the docker-compose.yml file
+4. restore the database dump in the new PostgreSQL container
+
+Requirements:
+- docker, docker compose, yq
+- the PostgreSQL container must use bind-mounts
+- a docker-compose.yml file in the current working directory
+
+${__usage}
+
+Options:
+--service-name=NAME  name of the PostgreSQL Docker Compose service
+                      The service name as declared in the docker-compose.yml 'services:' array
+--data-dir=DIR       PostgreSQL data directory bind-mount
+                      This directory is renamed with a '-bak' suffix during the upgrade
+--new-image=IMAGE    label of the upgraded PostgreSQL Docker image
+                      This value will be written to the 'image:' attribute in the docker-compose.yml file
+--username=USER      PostgreSQL username to use for the backup/restore
+                      This must be equal to the value used for the POSTGRES_USER environment variable
+--default-db=DB      PostgreSQL default database name
+                      This must be equal to the value used for the POSTGRES_DB environment variable
+"
+
+set -euo pipefail
+
+which yq &> /dev/null || ( echo 'error: yq not found: yq is required for updating the PostgreSQL image version in the docker-compose.yml file' >&2 ; exit 1 )
+
+function print_help() {
+  echo "${__help}"
+}
+
+function print_usage() {
+  echo "${__usage}"
+}
+
+function require_arg() {
+  if [[ -z ${2:-} ]] ; then
+    echo "error: missing required value for argument $1" >&2
+    print_usage
+    exit 1
+  fi
+}
+
+ARG_SERVICE_NAME=
+ARG_DATA_DIR=
+ARG_VOLUME=
+ARG_NEW_IMAGE=
+ARG_POSTGRES_USER=
+ARG_POSTGRES_DB=
+
+if [[ "$#" -eq 0 || "$1" == "--help" ]] ; then
+  print_help
+  exit 0
+fi
+
+if [[ "$1" != "upgrade" ]] ; then
+  print_usage
+  exit 1
+fi
+shift
+
+while [[ "$#" -gt 0 ]] ; do
+  case "$1" in
+    --service-name=*) ARG_SERVICE_NAME="${1#*=}" ;;
+    --service-name) require_arg "$@" ; ARG_SERVICE_NAME="$2"; shift ;;
+    --data-dir=*) ARG_DATA_DIR="${1#*=}" ;;
+    --data-dir) require_arg "$@" ; ARG_DATA_DIR="$2"; shift ;;
+    --username=*) ARG_POSTGRES_USER="${1#*=}" ;;
+    --username) require_arg "$@" ; ARG_POSTGRES_USER="$2"; shift ;;
+    --new-image=*) ARG_NEW_IMAGE="${1#*=}" ;;
+    --new-image) require_arg "$@" ; ARG_NEW_IMAGE="$2"; shift ;;
+    --default-db=*) ARG_POSTGRES_DB="${1#*=}" ;;
+    --default-db) require_arg "$@" ; ARG_POSTGRES_DB="$2"; shift ;;
+    -*|--*=)
+      echo "error: unknown argument $1" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: this command does not accept positional arguments"
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "${ARG_SERVICE_NAME}" || -z "${ARG_DATA_DIR}" || -z "${ARG_POSTGRES_USER}" || -z "${ARG_NEW_IMAGE}" ]] ; then
+  echo "error: ${__usage}"
+  exit 1
+fi
+
+function wait_for_database() {
+  local container_name="${1}"
+  echo '-- waiting for database connection'
+  while ! docker exec -u postgres "${container_name}" pg_isready ; do
+    sleep 0.5
+  done
+
+  sleep 2
+
+  while ! docker exec -u postgres "${container_name}" pg_isready ; do
+    sleep 0.5
+  done
+  echo '-- database connection established'
+}
+
+BACKUP_FILENAME="$(date +"%Y-%m-%d_%H-%M-%S")_postgres-backup.sql"
+
+# safety checks
+if [[ ! -e docker-compose.yml ]] ; then
+  echo "error: a docker-compose.yml file is not present in the current working directory" >&2
+  exit 1
+fi
+if [[ ! -e "${ARG_DATA_DIR}" || ! -d "${ARG_DATA_DIR}" ]] ; then
+  echo "error: the given data directory does not exist or is not a directory" >&2
+  exit 1
+fi
+ARG_DATA_DIR="$(realpath -s "${ARG_DATA_DIR}")"
+if [[ -e "${ARG_DATA_DIR}-bak" ]] ; then
+  echo "error: data directory backup already exists: ${ARG_DATA_DIR}-bak" >&2
+  exit 1
+fi
+
+echo "-- backup will be written to ${BACKUP_FILENAME}"
+
+DOCKER_RUN_ID1=
+DOCKER_RUN_ID2=
+function cleanup() {
+  if [[ -n "${DOCKER_RUN_ID1}" ]] ; then
+    docker kill "${DOCKER_RUN_ID1}" &> /dev/null
+  fi
+  if [[ -n "${DOCKER_RUN_ID2}" ]] ; then
+    docker kill "${DOCKER_RUN_ID2}" &> /dev/null
+  fi
+}
+trap cleanup EXIT
+
+
+echo "-- docker compose down"
+docker compose down
+
+echo "-- running temporary (old) postgres container for backup"
+DOCKER_RUN_ID1="$(docker compose run --rm --detach --remove-orphans "${ARG_SERVICE_NAME}")"
+wait_for_database "${DOCKER_RUN_ID1}"
+
+echo "-- creating backup (this may take a while)"
+docker exec -it "${DOCKER_RUN_ID1}" pg_dumpall --username="${ARG_POSTGRES_USER}" > "${BACKUP_FILENAME}"
+
+echo "-- backup done, stopping temporary container"
+docker stop "${DOCKER_RUN_ID1}"
+
+echo "-- moving the data directory"
+sudo mv "${ARG_DATA_DIR}" "${ARG_DATA_DIR}-bak"
+
+echo "-- replacing the referenced postgres docker image with the new image"
+yq --in-place --yaml-roundtrip '.services["'"${ARG_SERVICE_NAME}"'"].image = "'"${ARG_NEW_IMAGE}"'"' docker-compose.yml
+
+echo "-- running temporary (new) postgres container for restore"
+DOCKER_RUN_ID2="$(docker compose run --rm --detach --remove-orphans "${ARG_SERVICE_NAME}")"
+wait_for_database "${DOCKER_RUN_ID2}"
+
+echo "-- restoring backup (this may take a while)"
+docker exec -i "${DOCKER_RUN_ID2}" psql --username="${ARG_POSTGRES_USER}" "${ARG_POSTGRES_DB:-ARG_POSTGRES_USER}" < "${BACKUP_FILENAME}"
+
+echo "-- restore done, stopping temporary container"
+docker stop "${DOCKER_RUN_ID2}"
